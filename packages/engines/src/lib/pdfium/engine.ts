@@ -13,6 +13,7 @@ import {
   Logger,
   NoopLogger,
   SearchResult,
+  MatchFlag,
   PdfDestinationObject,
   PdfBookmarkObject,
   PdfDocumentObject,
@@ -136,6 +137,7 @@ import {
   PdfBlendMode,
 } from '@embedpdf/models';
 import { computeFormDrawParams, isValidCustomKey, readArrayBuffer, readString } from './helper';
+import { compactText, isWholeWordMatch } from './search-text';
 import { WrappedPdfiumModule } from '@embedpdf/pdfium';
 import { DocumentContext, PageContext, PdfCache } from './cache';
 import { MemoryManager } from './core/memory-manager';
@@ -10451,11 +10453,7 @@ export class PdfiumNative implements IPdfiumExecutor {
    *
    * @private
    */
-  private readPageBoxes(
-    docPtr: number,
-    index: number,
-    boxPtr: number,
-  ): PdfPageBoxes | undefined {
+  private readPageBoxes(docPtr: number, index: number, boxPtr: number): PdfPageBoxes | undefined {
     const readBox = (boxType: number): Box | undefined => {
       const ok = this.pdfiumModule.EPDF_GetPageBoxByIndex(docPtr, index, boxType, boxPtr);
       if (!ok) {
@@ -10862,16 +10860,8 @@ export class PdfiumNative implements IPdfiumExecutor {
         message: 'Document is not open',
       });
     }
-    const length = 2 * (keyword.length + 1);
-    const keywordPtr = this.memoryManager.malloc(length);
-    this.pdfiumModule.pdfium.stringToUTF16(keyword, keywordPtr, length);
-
-    try {
-      const results = this.searchAllInPage(doc, ctx, page, keywordPtr, flags);
-      return PdfTaskHelper.resolve(results);
-    } finally {
-      this.memoryManager.free(keywordPtr);
-    }
+    const results = this.searchAllInPage(doc, ctx, page, keyword, flags);
+    return PdfTaskHelper.resolve(results);
   }
 
   /**
@@ -10977,35 +10967,26 @@ export class PdfiumNative implements IPdfiumExecutor {
         return;
       }
 
-      // Allocate keyword pointer once for all pages
-      const length = 2 * (keyword.length + 1);
-      const keywordPtr = this.memoryManager.malloc(length);
-      this.pdfiumModule.pdfium.stringToUTF16(keyword, keywordPtr, length);
+      const results: Record<number, SearchResult[]> = {};
+      const total = pages.length;
 
-      try {
-        const results: Record<number, SearchResult[]> = {};
-        const total = pages.length;
+      // Process all pages in a tight loop - no queue overhead!
+      for (let i = 0; i < pages.length; i++) {
+        const page = pages[i];
+        const pageResults = this.searchAllInPage(doc, ctx, page, keyword, flags);
+        results[page.index] = pageResults;
 
-        // Process all pages in a tight loop - no queue overhead!
-        for (let i = 0; i < pages.length; i++) {
-          const page = pages[i];
-          const pageResults = this.searchAllInPage(doc, ctx, page, keywordPtr, flags);
-          results[page.index] = pageResults;
-
-          // Stream progress per page
-          task.progress({
-            pageIndex: page.index,
-            result: pageResults,
-            completed: i + 1,
-            total,
-          });
-        }
-
-        this.logger.perf(LOG_SOURCE, LOG_CATEGORY, 'SearchBatch', 'End', doc.id);
-        task.resolve(results);
-      } finally {
-        this.memoryManager.free(keywordPtr);
+        // Stream progress per page
+        task.progress({
+          pageIndex: page.index,
+          result: pageResults,
+          completed: i + 1,
+          total,
+        });
       }
+
+      this.logger.perf(LOG_SOURCE, LOG_CATEGORY, 'SearchBatch', 'End', doc.id);
+      task.resolve(results);
     });
 
     return task;
@@ -11101,10 +11082,16 @@ export class PdfiumNative implements IPdfiumExecutor {
    * Search for all occurrences of a keyword on a single page
    * This method efficiently loads the page only once and finds all matches
    *
+   * Matching ignores whitespace on both sides, so a keyword typed without the
+   * page's spacing still hits (`invoice` finds a letter-spaced `i n v o i c e`)
+   * and the other way round — see ./search-text for why PDFium's own literal
+   * find is not enough. Honours MatchFlag.MatchCase and MatchFlag.MatchWholeWord;
+   * matches are non-overlapping, so MatchFlag.MatchConsecutive has no effect.
+   *
    * @param docPtr - pointer to pdf document
    * @param page - pdf page object
    * @param pageIndex - index of the page
-   * @param keywordPtr - pointer to the search keyword
+   * @param keyword - the search keyword
    * @param flag - search flags
    * @returns array of search results on this page
    *
@@ -11114,7 +11101,7 @@ export class PdfiumNative implements IPdfiumExecutor {
     doc: PdfDocumentObject,
     ctx: DocumentContext,
     page: PdfPageObject,
-    keywordPtr: number,
+    keyword: string,
     flag: number,
   ): SearchResult[] {
     return ctx.borrowPage(page.index, (pageCtx) => {
@@ -11127,20 +11114,31 @@ export class PdfiumNative implements IPdfiumExecutor {
       const fullText = this.pdfiumModule.pdfium.UTF16ToString(bufPtr);
       this.memoryManager.free(bufPtr);
 
+      const matchCase = (flag & MatchFlag.MatchCase) !== 0;
+      const wholeWord = (flag & MatchFlag.MatchWholeWord) !== 0;
+
+      const needle = compactText(keyword, matchCase);
+      if (needle.compacted.length === 0) {
+        return [];
+      }
+
+      const haystack = compactText(fullText, matchCase);
       const pageResults: SearchResult[] = [];
 
-      // Initialize search handle once for the page
-      const searchHandle = this.pdfiumModule.FPDFText_FindStart(
-        textPagePtr,
-        keywordPtr,
-        flag,
-        0, // Start from the beginning of the page
-      );
+      for (
+        let at = haystack.compacted.indexOf(needle.compacted);
+        at !== -1;
+        at = haystack.compacted.indexOf(needle.compacted, at + needle.compacted.length)
+      ) {
+        // Back to original character space, so a hit spans the whitespace that
+        // was dropped inside it.
+        const charIndex = haystack.originalIndices[at];
+        const lastCharIndex = haystack.originalIndices[at + needle.compacted.length - 1];
+        const charCount = lastCharIndex - charIndex + 1;
 
-      // Call FindNext repeatedly to get all matches on the page
-      while (this.pdfiumModule.FPDFText_FindNext(searchHandle)) {
-        const charIndex = this.pdfiumModule.FPDFText_GetSchResultIndex(searchHandle);
-        const charCount = this.pdfiumModule.FPDFText_GetSchCount(searchHandle);
+        if (wholeWord && !isWholeWordMatch(fullText, charIndex, charCount)) {
+          continue;
+        }
 
         const rects = this.getHighlightRects(doc, page, textPagePtr, charIndex, charCount);
 
@@ -11155,8 +11153,6 @@ export class PdfiumNative implements IPdfiumExecutor {
         });
       }
 
-      // Close the search handle only once after finding all results
-      this.pdfiumModule.FPDFText_FindClose(searchHandle);
       return pageResults;
     });
   }
